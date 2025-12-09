@@ -169,7 +169,7 @@ curl -X POST https://your-domain.com/mcp/ \
 
 ## 📜 License
 
-MIT License — Use it, modify it, ship it.
+GNU General Public License v3.0
 
 ---
 
