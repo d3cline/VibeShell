@@ -567,6 +567,130 @@ function get_tools_definition(): array
         'additionalProperties' => false,
     ],
 ],
+        [
+            'name'        => 'fs_read_lines',
+            'description' => 'Read specific line ranges from a file. More efficient than byte-based reads for text files.',
+            'inputSchema' => [
+                'type'       => 'object',
+                'properties' => [
+                    'path' => [
+                        'type'        => 'string',
+                        'description' => 'File path to read; relative or absolute ("~/...").',
+                    ],
+                    'start_line' => [
+                        'type'        => 'integer',
+                        'description' => 'First line to read (1-indexed). Defaults to 1.',
+                        'minimum'     => 1,
+                    ],
+                    'end_line' => [
+                        'type'        => 'integer',
+                        'description' => 'Last line to read (1-indexed, inclusive). Defaults to start_line + 99.',
+                        'minimum'     => 1,
+                    ],
+                    'context_lines' => [
+                        'type'        => 'integer',
+                        'description' => 'Extra lines of context before start_line and after end_line (default 0).',
+                        'minimum'     => 0,
+                        'maximum'     => 50,
+                    ],
+                ],
+                'required'             => ['path'],
+                'additionalProperties' => false,
+            ],
+        ],
+        [
+            'name'        => 'fs_patch',
+            'description' => 'Apply line-based patches to a file. Efficient for modifying specific sections of large files without sending entire content.',
+            'inputSchema' => [
+                'type'       => 'object',
+                'properties' => [
+                    'path' => [
+                        'type'        => 'string',
+                        'description' => 'File path to patch; relative or absolute ("~/...").',
+                    ],
+                    'patches' => [
+                        'type'        => 'array',
+                        'description' => 'Array of patch operations to apply in order.',
+                        'items'       => [
+                            'type'       => 'object',
+                            'properties' => [
+                                'op' => [
+                                    'type'        => 'string',
+                                    'description' => 'Operation: "replace" (replace lines), "insert" (insert before line), "delete" (delete lines), or "replace_string" (find and replace text).',
+                                    'enum'        => ['replace', 'insert', 'delete', 'replace_string'],
+                                ],
+                                'start_line' => [
+                                    'type'        => 'integer',
+                                    'description' => 'For replace/delete: first line to affect. For insert: line before which to insert.',
+                                    'minimum'     => 1,
+                                ],
+                                'end_line' => [
+                                    'type'        => 'integer',
+                                    'description' => 'For replace/delete: last line to affect (inclusive). Not used for insert.',
+                                    'minimum'     => 1,
+                                ],
+                                'content' => [
+                                    'type'        => 'string',
+                                    'description' => 'For replace/insert: the new content (lines separated by newlines). Not used for delete.',
+                                ],
+                                'search' => [
+                                    'type'        => 'string',
+                                    'description' => 'For replace_string: the exact text to find.',
+                                ],
+                                'replace' => [
+                                    'type'        => 'string',
+                                    'description' => 'For replace_string: the text to replace with.',
+                                ],
+                                'count' => [
+                                    'type'        => 'integer',
+                                    'description' => 'For replace_string: max occurrences to replace (default 1, use -1 for all).',
+                                ],
+                            ],
+                            'required' => ['op'],
+                        ],
+                    ],
+                    'dry_run' => [
+                        'type'        => 'boolean',
+                        'description' => 'If true, return what would change without actually modifying the file.',
+                    ],
+                    'backup' => [
+                        'type'        => 'boolean',
+                        'description' => 'If true, create a .bak backup before patching.',
+                    ],
+                ],
+                'required'             => ['path', 'patches'],
+                'additionalProperties' => false,
+            ],
+        ],
+        [
+            'name'        => 'fs_diff',
+            'description' => 'Generate a unified diff between two files, or between file content and provided content.',
+            'inputSchema' => [
+                'type'       => 'object',
+                'properties' => [
+                    'path' => [
+                        'type'        => 'string',
+                        'description' => 'Path to the original file.',
+                    ],
+                    'path2' => [
+                        'type'        => 'string',
+                        'description' => 'Path to the second file to compare against (optional if content2 is provided).',
+                    ],
+                    'content2' => [
+                        'type'        => 'string',
+                        'description' => 'Content to compare against the file (alternative to path2).',
+                    ],
+                    'context_lines' => [
+                        'type'        => 'integer',
+                        'description' => 'Number of context lines in diff output (default 3).',
+                        'minimum'     => 0,
+                        'maximum'     => 20,
+                    ],
+                ],
+                'required'             => ['path'],
+                'additionalProperties' => false,
+            ],
+        ],
 
     ];
 }
@@ -1105,6 +1229,539 @@ function fs_delete_tool(string $homeDir, string $baseDir, array $args): array
 }
 
 
+/**
+ * Implement fs_read_lines tool - read specific line ranges from a file.
+ */
+function fs_read_lines_tool(string $homeDir, string $baseDir, array $args): array
+{
+    $pathArg = isset($args['path']) && is_string($args['path']) ? $args['path'] : '';
+    if ($pathArg === '') {
+        return tool_error_result('path is required', []);
+    }
+
+    $startLine = isset($args['start_line']) ? max(1, (int)$args['start_line']) : 1;
+    $endLine = isset($args['end_line']) ? max(1, (int)$args['end_line']) : ($startLine + 99);
+    $contextLines = isset($args['context_lines']) ? min(50, max(0, (int)$args['context_lines'])) : 0;
+
+    // Adjust for context
+    $actualStart = max(1, $startLine - $contextLines);
+    $actualEnd = $endLine + $contextLines;
+
+    try {
+        $full = resolve_path($pathArg, $baseDir, $homeDir);
+    } catch (RuntimeException $e) {
+        return tool_error_result($e->getMessage(), ['path' => $pathArg]);
+    }
+
+    if (!is_file($full)) {
+        return tool_error_result('Not a file or not found', [
+            'path'    => $pathArg,
+            'resolved'=> $full,
+        ]);
+    }
+
+    if (!is_readable($full)) {
+        return tool_error_result('File not readable', [
+            'path'    => $pathArg,
+            'resolved'=> $full,
+        ]);
+    }
+
+    $fh = @fopen($full, 'rb');
+    if ($fh === false) {
+        return tool_error_result('Failed to open file', [
+            'path'    => $pathArg,
+            'resolved'=> $full,
+        ]);
+    }
+
+    $lines = [];
+    $lineNum = 0;
+    $totalLines = 0;
+
+    while (($line = fgets($fh)) !== false) {
+        $lineNum++;
+        $totalLines = $lineNum;
+
+        if ($lineNum >= $actualStart && $lineNum <= $actualEnd) {
+            $lines[] = [
+                'num'     => $lineNum,
+                'content' => rtrim($line, "\r\n"),
+                'context' => ($lineNum < $startLine || $lineNum > $endLine),
+            ];
+        }
+
+        if ($lineNum > $actualEnd) {
+            // Continue counting total lines
+            while (fgets($fh) !== false) {
+                $totalLines++;
+            }
+            break;
+        }
+    }
+
+    fclose($fh);
+
+    return [
+        'path'          => $pathArg,
+        'resolved_path' => $full,
+        'start_line'    => $startLine,
+        'end_line'      => $endLine,
+        'actual_start'  => $actualStart,
+        'actual_end'    => min($actualEnd, $totalLines),
+        'context_lines' => $contextLines,
+        'total_lines'   => $totalLines,
+        'lines_returned'=> count($lines),
+        'lines'         => $lines,
+    ];
+}
+
+/**
+ * Implement fs_patch tool - apply line-based patches to a file.
+ */
+function fs_patch_tool(string $homeDir, string $baseDir, array $args): array
+{
+    $pathArg = isset($args['path']) && is_string($args['path']) ? $args['path'] : '';
+    if ($pathArg === '') {
+        return tool_error_result('path is required', []);
+    }
+
+    $patches = isset($args['patches']) && is_array($args['patches']) ? $args['patches'] : [];
+    if (empty($patches)) {
+        return tool_error_result('patches array is required and cannot be empty', []);
+    }
+
+    $dryRun = isset($args['dry_run']) ? (bool)$args['dry_run'] : false;
+    $backup = isset($args['backup']) ? (bool)$args['backup'] : false;
+
+    try {
+        $full = resolve_path($pathArg, $baseDir, $homeDir);
+    } catch (RuntimeException $e) {
+        return tool_error_result($e->getMessage(), ['path' => $pathArg]);
+    }
+
+    // Protect sensitive files
+    if (is_protected_path($full, $homeDir)) {
+        return tool_error_result('Cannot modify protected file', [
+            'path' => $pathArg,
+        ]);
+    }
+
+    if (!is_file($full)) {
+        return tool_error_result('Not a file or not found', [
+            'path'    => $pathArg,
+            'resolved'=> $full,
+        ]);
+    }
+
+    if (!is_readable($full) || (!$dryRun && !is_writable($full))) {
+        return tool_error_result('File not readable/writable', [
+            'path'    => $pathArg,
+            'resolved'=> $full,
+        ]);
+    }
+
+    // Read the file into lines
+    $content = @file_get_contents($full);
+    if ($content === false) {
+        return tool_error_result('Failed to read file', [
+            'path'    => $pathArg,
+            'resolved'=> $full,
+        ]);
+    }
+
+    $originalContent = $content;
+    $lines = explode("\n", $content);
+    $operations = [];
+
+    // Process each patch
+    foreach ($patches as $idx => $patch) {
+        if (!isset($patch['op']) || !is_string($patch['op'])) {
+            return tool_error_result("Patch $idx: 'op' is required", ['patch' => $patch]);
+        }
+
+        $op = $patch['op'];
+
+        switch ($op) {
+            case 'replace':
+                $start = isset($patch['start_line']) ? (int)$patch['start_line'] : 0;
+                $end = isset($patch['end_line']) ? (int)$patch['end_line'] : $start;
+                $newContent = isset($patch['content']) ? $patch['content'] : '';
+
+                if ($start < 1 || $end < $start) {
+                    return tool_error_result("Patch $idx: invalid line range", ['start' => $start, 'end' => $end]);
+                }
+
+                $newLines = $newContent === '' ? [] : explode("\n", $newContent);
+                
+                // Replace lines (1-indexed to 0-indexed)
+                array_splice($lines, $start - 1, $end - $start + 1, $newLines);
+                
+                $operations[] = [
+                    'op'    => 'replace',
+                    'start' => $start,
+                    'end'   => $end,
+                    'removed_count' => $end - $start + 1,
+                    'added_count'   => count($newLines),
+                ];
+                break;
+
+            case 'insert':
+                $beforeLine = isset($patch['start_line']) ? (int)$patch['start_line'] : 0;
+                $newContent = isset($patch['content']) ? $patch['content'] : '';
+
+                if ($beforeLine < 1) {
+                    return tool_error_result("Patch $idx: start_line must be >= 1 for insert", ['start_line' => $beforeLine]);
+                }
+
+                $newLines = $newContent === '' ? [] : explode("\n", $newContent);
+                
+                // Insert before the specified line
+                array_splice($lines, $beforeLine - 1, 0, $newLines);
+                
+                $operations[] = [
+                    'op'           => 'insert',
+                    'before_line'  => $beforeLine,
+                    'added_count'  => count($newLines),
+                ];
+                break;
+
+            case 'delete':
+                $start = isset($patch['start_line']) ? (int)$patch['start_line'] : 0;
+                $end = isset($patch['end_line']) ? (int)$patch['end_line'] : $start;
+
+                if ($start < 1 || $end < $start) {
+                    return tool_error_result("Patch $idx: invalid line range for delete", ['start' => $start, 'end' => $end]);
+                }
+
+                array_splice($lines, $start - 1, $end - $start + 1);
+                
+                $operations[] = [
+                    'op'            => 'delete',
+                    'start'         => $start,
+                    'end'           => $end,
+                    'removed_count' => $end - $start + 1,
+                ];
+                break;
+
+            case 'replace_string':
+                $search = isset($patch['search']) ? $patch['search'] : '';
+                $replace = isset($patch['replace']) ? $patch['replace'] : '';
+                $count = isset($patch['count']) ? (int)$patch['count'] : 1;
+
+                if ($search === '') {
+                    return tool_error_result("Patch $idx: 'search' cannot be empty for replace_string", []);
+                }
+
+                $contentStr = implode("\n", $lines);
+                $occurrences = substr_count($contentStr, $search);
+                
+                if ($occurrences === 0) {
+                    return tool_error_result("Patch $idx: search string not found", ['search' => $search]);
+                }
+
+                if ($count === -1) {
+                    // Replace all occurrences
+                    $contentStr = str_replace($search, $replace, $contentStr);
+                    $replacedCount = $occurrences;
+                } else {
+                    // Replace limited occurrences
+                    $replacedCount = 0;
+                    $pos = 0;
+                    while ($replacedCount < $count && ($pos = strpos($contentStr, $search, $pos)) !== false) {
+                        $contentStr = substr_replace($contentStr, $replace, $pos, strlen($search));
+                        $pos += strlen($replace);
+                        $replacedCount++;
+                    }
+                }
+
+                $lines = explode("\n", $contentStr);
+                
+                $operations[] = [
+                    'op'             => 'replace_string',
+                    'search'         => $search,
+                    'occurrences'    => $occurrences,
+                    'replaced_count' => $replacedCount,
+                ];
+                break;
+
+            default:
+                return tool_error_result("Patch $idx: unknown operation '$op'", ['valid_ops' => ['replace', 'insert', 'delete', 'replace_string']]);
+        }
+    }
+
+    $newContent = implode("\n", $lines);
+
+    if ($dryRun) {
+        return [
+            'path'           => $pathArg,
+            'resolved_path'  => $full,
+            'dry_run'        => true,
+            'operations'     => $operations,
+            'original_lines' => substr_count($originalContent, "\n") + 1,
+            'new_lines'      => count($lines),
+            'changed'        => $newContent !== $originalContent,
+        ];
+    }
+
+    // Create backup if requested
+    if ($backup) {
+        $backupPath = $full . '.bak';
+        if (!@copy($full, $backupPath)) {
+            return tool_error_result('Failed to create backup', ['backup_path' => $backupPath]);
+        }
+    }
+
+    // Write the patched content
+    $bytes = @file_put_contents($full, $newContent, LOCK_EX);
+    if ($bytes === false) {
+        return tool_error_result('Failed to write patched file', [
+            'path'    => $pathArg,
+            'resolved'=> $full,
+        ]);
+    }
+
+    return [
+        'path'           => $pathArg,
+        'resolved_path'  => $full,
+        'dry_run'        => false,
+        'backup'         => $backup,
+        'backup_path'    => $backup ? ($full . '.bak') : null,
+        'operations'     => $operations,
+        'original_lines' => substr_count($originalContent, "\n") + 1,
+        'new_lines'      => count($lines),
+        'bytes_written'  => $bytes,
+    ];
+}
+
+/**
+ * Simple unified diff generator.
+ */
+function generate_unified_diff(array $from, array $to, string $fromLabel, string $toLabel, int $context = 3): string
+{
+    $diff = [];
+    $diff[] = "--- $fromLabel";
+    $diff[] = "+++ $toLabel";
+
+    $fromLen = count($from);
+    $toLen = count($to);
+
+    // Simple LCS-based diff using dynamic programming
+    // Build edit script
+    $m = $fromLen;
+    $n = $toLen;
+
+    // For simplicity, use a basic approach: find matching blocks
+    $hunks = [];
+    $i = 0;
+    $j = 0;
+    $currentHunk = null;
+
+    while ($i < $m || $j < $n) {
+        // Find next difference
+        while ($i < $m && $j < $n && $from[$i] === $to[$j]) {
+            if ($currentHunk !== null) {
+                $currentHunk['lines'][] = [' ', $from[$i], $i + 1, $j + 1];
+            }
+            $i++;
+            $j++;
+        }
+
+        if ($i >= $m && $j >= $n) {
+            break;
+        }
+
+        // Start new hunk if needed
+        if ($currentHunk === null) {
+            $hunkStart = max(0, $i - $context);
+            $currentHunk = [
+                'from_start' => $hunkStart + 1,
+                'to_start'   => max(0, $j - $context) + 1,
+                'lines'      => [],
+            ];
+            // Add context before
+            for ($k = $hunkStart; $k < $i; $k++) {
+                $currentHunk['lines'][] = [' ', $from[$k], $k + 1, $k + 1];
+            }
+        }
+
+        // Handle deletions and additions
+        $deleted = 0;
+        $added = 0;
+        
+        // Look ahead to find next matching point
+        $lookAhead = min(50, max($m - $i, $n - $j));
+        $bestMatch = null;
+        
+        for ($d = 1; $d <= $lookAhead && $bestMatch === null; $d++) {
+            // Check if from[i+d] matches any to[j..j+d]
+            if ($i + $d <= $m) {
+                for ($jj = $j; $jj <= min($j + $d, $n - 1); $jj++) {
+                    if ($i + $d - 1 < $m && $jj < $n && $from[$i + $d - 1] === $to[$jj]) {
+                        // Check for a run of matches
+                        $matchLen = 0;
+                        while ($i + $d - 1 + $matchLen < $m && $jj + $matchLen < $n && 
+                               $from[$i + $d - 1 + $matchLen] === $to[$jj + $matchLen]) {
+                            $matchLen++;
+                        }
+                        if ($matchLen >= 2) {
+                            $bestMatch = ['from' => $i + $d - 1, 'to' => $jj];
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($bestMatch !== null) {
+            // Add deleted lines
+            while ($i < $bestMatch['from']) {
+                $currentHunk['lines'][] = ['-', $from[$i], $i + 1, null];
+                $i++;
+            }
+            // Add added lines
+            while ($j < $bestMatch['to']) {
+                $currentHunk['lines'][] = ['+', $to[$j], null, $j + 1];
+                $j++;
+            }
+        } else {
+            // No match found, consume remaining lines
+            while ($i < $m) {
+                $currentHunk['lines'][] = ['-', $from[$i], $i + 1, null];
+                $i++;
+            }
+            while ($j < $n) {
+                $currentHunk['lines'][] = ['+', $to[$j], null, $j + 1];
+                $j++;
+            }
+        }
+
+        // Check if we should close this hunk
+        $contextAfter = 0;
+        $lastChangeIdx = count($currentHunk['lines']) - 1;
+        while ($lastChangeIdx >= 0 && $currentHunk['lines'][$lastChangeIdx][0] === ' ') {
+            $contextAfter++;
+            $lastChangeIdx--;
+        }
+
+        if ($contextAfter >= $context * 2 || ($i >= $m && $j >= $n)) {
+            // Trim trailing context and save hunk
+            while (count($currentHunk['lines']) > 0 && 
+                   $currentHunk['lines'][count($currentHunk['lines']) - 1][0] === ' ' &&
+                   $contextAfter > $context) {
+                array_pop($currentHunk['lines']);
+                $contextAfter--;
+            }
+            $hunks[] = $currentHunk;
+            $currentHunk = null;
+        }
+    }
+
+    if ($currentHunk !== null && !empty($currentHunk['lines'])) {
+        $hunks[] = $currentHunk;
+    }
+
+    // Format hunks
+    foreach ($hunks as $hunk) {
+        $fromCount = 0;
+        $toCount = 0;
+        foreach ($hunk['lines'] as $line) {
+            if ($line[0] === '-' || $line[0] === ' ') $fromCount++;
+            if ($line[0] === '+' || $line[0] === ' ') $toCount++;
+        }
+        
+        $diff[] = sprintf("@@ -%d,%d +%d,%d @@", 
+            $hunk['from_start'], $fromCount,
+            $hunk['to_start'], $toCount
+        );
+        
+        foreach ($hunk['lines'] as $line) {
+            $diff[] = $line[0] . $line[1];
+        }
+    }
+
+    return implode("\n", $diff);
+}
+
+/**
+ * Implement fs_diff tool - generate unified diff between files or content.
+ */
+function fs_diff_tool(string $homeDir, string $baseDir, array $args): array
+{
+    $pathArg = isset($args['path']) && is_string($args['path']) ? $args['path'] : '';
+    if ($pathArg === '') {
+        return tool_error_result('path is required', []);
+    }
+
+    $path2Arg = isset($args['path2']) && is_string($args['path2']) ? $args['path2'] : '';
+    $content2 = isset($args['content2']) && is_string($args['content2']) ? $args['content2'] : null;
+    $contextLines = isset($args['context_lines']) ? min(20, max(0, (int)$args['context_lines'])) : 3;
+
+    if ($path2Arg === '' && $content2 === null) {
+        return tool_error_result('Either path2 or content2 is required', []);
+    }
+
+    try {
+        $full = resolve_path($pathArg, $baseDir, $homeDir);
+    } catch (RuntimeException $e) {
+        return tool_error_result($e->getMessage(), ['path' => $pathArg]);
+    }
+
+    if (!is_file($full) || !is_readable($full)) {
+        return tool_error_result('File not found or not readable', [
+            'path'    => $pathArg,
+            'resolved'=> $full,
+        ]);
+    }
+
+    $content1 = @file_get_contents($full);
+    if ($content1 === false) {
+        return tool_error_result('Failed to read file', ['path' => $pathArg]);
+    }
+
+    $label2 = 'new';
+    $full2 = null;
+
+    if ($path2Arg !== '') {
+        try {
+            $full2 = resolve_path($path2Arg, $baseDir, $homeDir);
+        } catch (RuntimeException $e) {
+            return tool_error_result($e->getMessage(), ['path2' => $path2Arg]);
+        }
+
+        if (!is_file($full2) || !is_readable($full2)) {
+            return tool_error_result('Second file not found or not readable', [
+                'path2'   => $path2Arg,
+                'resolved'=> $full2,
+            ]);
+        }
+
+        $content2 = @file_get_contents($full2);
+        if ($content2 === false) {
+            return tool_error_result('Failed to read second file', ['path2' => $path2Arg]);
+        }
+        $label2 = $path2Arg;
+    }
+
+    $lines1 = explode("\n", $content1);
+    $lines2 = explode("\n", $content2);
+
+    $diff = generate_unified_diff($lines1, $lines2, $pathArg, $label2, $contextLines);
+    $identical = ($content1 === $content2);
+
+    return [
+        'path'           => $pathArg,
+        'resolved_path'  => $full,
+        'path2'          => $path2Arg ?: null,
+        'resolved_path2' => $full2,
+        'context_lines'  => $contextLines,
+        'identical'      => $identical,
+        'lines_file1'    => count($lines1),
+        'lines_file2'    => count($lines2),
+        'diff'           => $identical ? '' : $diff,
+    ];
+}
+
 
 /**
  * Tail the last N lines of a file (simple implementation).
@@ -1424,6 +2081,24 @@ function handle_mcp_jsonrpc(array $rpc): void
                 case 'fs_rm':
                     $resultPayload = tool_ok_result(
                         fs_delete_tool($homeDir, $baseDir, $args)
+                    );
+                    break;
+
+                case 'fs_read_lines':
+                    $resultPayload = tool_ok_result(
+                        fs_read_lines_tool($homeDir, $baseDir, $args)
+                    );
+                    break;
+
+                case 'fs_patch':
+                    $resultPayload = tool_ok_result(
+                        fs_patch_tool($homeDir, $baseDir, $args)
+                    );
+                    break;
+
+                case 'fs_diff':
+                    $resultPayload = tool_ok_result(
+                        fs_diff_tool($homeDir, $baseDir, $args)
                     );
                     break;
 
