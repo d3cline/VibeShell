@@ -197,11 +197,11 @@ function resolve_base_dir(string $baseSetting, string $homeDir): string
 
 /**
  * Resolve a user-supplied path (may be relative, "~", or absolute) into an
- * absolute path within the user's home directory.
+ * absolute path within the configured base directory or the user's logs directory.
  *
  * Uses realpath() on existing paths to resolve symlinks and prevent symlink attacks.
  *
- * @throws RuntimeException if the resolved path escapes the home dir.
+ * @throws RuntimeException if the resolved path escapes the allowed directories.
  */
 function resolve_path(string $input, string $baseDir, string $homeDir): string
 {
@@ -239,11 +239,15 @@ function resolve_path(string $input, string $baseDir, string $homeDir): string
         }
     }
 
-    if (strpos($full, $homeDir . '/') !== 0 && $full !== $homeDir) {
-        throw new RuntimeException('Resolved path escapes home directory');
+    $allowedRoots = [$baseDir, $homeDir . '/logs'];
+    foreach ($allowedRoots as $allowedRoot) {
+        $allowedRoot = rtrim($allowedRoot, '/');
+        if ($full === $allowedRoot || strpos($full, $allowedRoot . '/') === 0) {
+            return $full;
+        }
     }
 
-    return $full;
+    throw new RuntimeException('Resolved path escapes allowed directories');
 }
 
 /**
@@ -399,7 +403,7 @@ function get_tools_definition(): array
         ],
         [
             'name'        => 'fs_list',
-            'description' => 'List files and directories under a given path (relative to base_dir or home).',
+            'description' => 'List files and directories within base_dir or ~/logs.',
             'inputSchema' => [
                 'type'       => 'object',
                 'properties' => [
@@ -449,13 +453,13 @@ function get_tools_definition(): array
         ],
         [
             'name'        => 'fs_write',
-            'description' => 'Write text content to a file within the home directory.',
+            'description' => 'Write text content to a file within base_dir or ~/logs.',
             'inputSchema' => [
                 'type'       => 'object',
                 'properties' => [
                     'path'   => [
                         'type'        => 'string',
-                        'description' => 'Target file path; relative to base_dir or absolute within home (e.g. "apps/foo/config.php" or "~/notes.txt").',
+                        'description' => 'Target file path; relative to base_dir or under ~/logs.',
                     ],
                     'content' => [
                         'type'        => 'string',
@@ -529,17 +533,17 @@ function get_tools_definition(): array
 
         [
             'name'        => 'fs_move',
-            'description' => 'Move or rename a file or directory within the user home (uses POSIX rename).',
+            'description' => 'Move or rename a file or directory within base_dir or ~/logs (uses POSIX rename).',
             'inputSchema' => [
                 'type'       => 'object',
                 'properties' => [
                     'from' => [
                         'type'        => 'string',
-                        'description' => 'Source path; relative to base_dir or absolute within home (e.g. "apps/foo" or "~/apps/foo").',
+                        'description' => 'Source path; relative to base_dir or under ~/logs.',
                     ],
                     'to'   => [
                         'type'        => 'string',
-                        'description' => 'Destination path; relative to base_dir or absolute within home.',
+                        'description' => 'Destination path; relative to base_dir or under ~/logs.',
                     ],
                     'overwrite' => [
                         'type'        => 'boolean',
@@ -557,13 +561,13 @@ function get_tools_definition(): array
 
 	[
     'name'        => 'fs_delete',
-    'description' => 'Delete a file, symlink, or directory within the user home (like rm). Optionally recursive for directories.',
+    'description' => 'Delete a file, symlink, or directory within base_dir or ~/logs (like rm). Optionally recursive for directories.',
     'inputSchema' => [
         'type'       => 'object',
         'properties' => [
             'path' => [
                 'type'        => 'string',
-                'description' => 'Target to delete; relative to base_dir or absolute within home (e.g. "apps/foo" or "~/logs/foo.log").',
+                'description' => 'Target to delete; relative to base_dir or under ~/logs.',
             ],
             'recursive' => [
                 'type'        => 'boolean',

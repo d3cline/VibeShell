@@ -91,7 +91,7 @@ Add to your MCP client configuration:
 ## 🔒 Security Features
 
 ### Path Protection
-- All paths are jailed to the user's home directory
+- File paths are jailed to the configured `base_dir` and `~/logs`
 - Symlinks are resolved via `realpath()` to prevent escape attacks
 - Path traversal attempts (`../`) are blocked
 
@@ -125,9 +125,9 @@ The config file `~/.mcp_vibeshell.ini` supports these options:
 ; Leave empty to disable auth (NOT recommended)
 token = "your-40-character-hex-token"
 
-; Optional: Restrict file operations to a subdirectory
+; Optional: Set the primary file-operation directory
 ; "~" = full home directory access (default)
-; "~/apps" = limit to apps folder only
+; "~/apps" = allow the apps folder plus ~/logs
 base_dir = "~"
 
 ; Optional: enable remote command execution. Keep false on file-only endpoints.
