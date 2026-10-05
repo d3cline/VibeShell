@@ -247,13 +247,13 @@ function resolve_path(string $input, string $baseDir, string $homeDir): string
 }
 
 /**
- * Load config from ~/.mcp_vibeshell.ini and return [homeDir, baseDir, token].
+ * Load config from ~/.mcp_vibeshell.ini.
  *
  * The config file is stored in the user's home directory, outside the webroot,
  * following the standard Unix dotfile convention for security.
  *
  * @param mixed $id JSON-RPC id for error responses.
- * @return array{0:string,1:string,2:string}
+ * @return array{0:string,1:string,2:string,3:array<string,mixed>}
  */
 function load_config_or_fail($id): array
 {
@@ -282,10 +282,17 @@ function load_config_or_fail($id): array
     $token = isset($section['token']) ? trim((string)$section['token']) : '';
     $baseSetting = isset($section['base_dir']) ? trim((string)$section['base_dir']) : '~';
 
+    $shellSettings = [
+        'enabled'     => isset($section['shell_enabled']) ? (bool)$section['shell_enabled'] : false,
+        'max_timeout' => min(900.0, max(0.1, isset($section['shell_max_timeout']) ? (float)$section['shell_max_timeout'] : 120.0)),
+        'max_output'  => min(16777216, max(4096, isset($section['shell_max_output_bytes']) ? (int)$section['shell_max_output_bytes'] : 1048576)),
+        'max_stdin'   => min(16777216, max(0, isset($section['shell_max_stdin_bytes']) ? (int)$section['shell_max_stdin_bytes'] : 1048576)),
+    ];
+
     $homeDir = determine_home_dir();
     $baseDir = resolve_base_dir($baseSetting, $homeDir);
 
-    return [$homeDir, $baseDir, $token];
+    return [$homeDir, $baseDir, $token, $shellSettings];
 }
 
 /**
@@ -688,6 +695,42 @@ function get_tools_definition(): array
                     ],
                 ],
                 'required'             => ['path'],
+                'additionalProperties' => false,
+            ],
+        ],
+        [
+            'name'        => 'shell_exec',
+            'description' => 'Execute a command in a directory under base_dir with bounded runtime and output. Disabled unless shell_enabled=true and Bearer auth is configured.',
+            'inputSchema' => [
+                'type'       => 'object',
+                'properties' => [
+                    'command' => [
+                        'description' => 'Command as an argv array (preferred) or a shell command string.',
+                        'oneOf'       => [
+                            ['type' => 'array', 'items' => ['type' => 'string'], 'minItems' => 1, 'maxItems' => 256],
+                            ['type' => 'string', 'minLength' => 1, 'maxLength' => 65536],
+                        ],
+                    ],
+                    'cwd' => [
+                        'type'        => 'string',
+                        'description' => 'Working directory under base_dir; defaults to base_dir.',
+                    ],
+                    'stdin' => [
+                        'type'        => 'string',
+                        'description' => 'Optional standard input, capped by server configuration.',
+                    ],
+                    'env' => [
+                        'type'                 => 'object',
+                        'description'          => 'Optional environment variables to add or override.',
+                        'additionalProperties' => ['type' => 'string'],
+                    ],
+                    'timeout_seconds' => [
+                        'type'        => 'number',
+                        'description' => 'Wall-clock timeout; capped by server configuration.',
+                        'minimum'     => 0.1,
+                    ],
+                ],
+                'required'             => ['command'],
                 'additionalProperties' => false,
             ],
         ],
@@ -1974,6 +2017,278 @@ function fs_search_tool(string $homeDir, string $baseDir, array $args): array
     ];
 }
 
+function append_process_output(string &$output, int &$discardedBytes, string $chunk, int $maxBytes): void
+{
+    $remaining = $maxBytes - strlen($output);
+    if ($remaining > 0) {
+        $output .= substr($chunk, 0, $remaining);
+    }
+    $discardedBytes += max(0, strlen($chunk) - max(0, $remaining));
+}
+
+function encode_process_output(string $output): array
+{
+    if (preg_match('//u', $output) === 1) {
+        return ['content' => $output, 'encoding' => 'utf-8'];
+    }
+
+    return ['content' => base64_encode($output), 'encoding' => 'base64'];
+}
+
+function terminate_process($process, array $status, int $signal, bool $processGroup): void
+{
+    $pid = isset($status['pid']) ? (int)$status['pid'] : 0;
+    if ($processGroup && $pid > 0 && function_exists('posix_kill')) {
+        @posix_kill(-$pid, $signal);
+        return;
+    }
+
+    @proc_terminate($process, $signal);
+}
+
+function shell_exec_tool(
+    string $homeDir,
+    string $baseDir,
+    string $token,
+    array $settings,
+    array $args
+): array {
+    if (empty($settings['enabled'])) {
+        return tool_error_result('Command execution is disabled by server configuration', [
+            'failure' => 'disabled',
+            'config'  => 'Set shell_enabled=true in ~/.mcp_vibeshell.ini',
+        ]);
+    }
+    if (trim($token) === '') {
+        return tool_error_result('Command execution requires a non-empty Bearer token', [
+            'failure' => 'authentication_required',
+        ]);
+    }
+    if (!function_exists('proc_open') || !is_callable('proc_open')) {
+        return tool_error_result('Command execution is unavailable because proc_open is disabled', [
+            'failure' => 'unsupported_host',
+        ]);
+    }
+    if (!array_key_exists('command', $args)) {
+        return tool_error_result('command is required', ['failure' => 'invalid_arguments']);
+    }
+
+    $command = $args['command'];
+    $displayCommand = $command;
+    if (is_array($command)) {
+        if (count($command) < 1 || count($command) > 256) {
+            return tool_error_result('command array must contain 1 to 256 arguments', ['failure' => 'invalid_arguments']);
+        }
+        $commandBytes = 0;
+        foreach ($command as $argument) {
+            if (!is_string($argument) || strpos($argument, "\0") !== false) {
+                return tool_error_result('Every command argument must be a string without NUL bytes', ['failure' => 'invalid_arguments']);
+            }
+            $commandBytes += strlen($argument);
+        }
+        if ($command[0] === '' || $commandBytes > 65536) {
+            return tool_error_result('Command is empty or exceeds 65536 bytes', ['failure' => 'invalid_arguments']);
+        }
+        $processCommand = $command;
+    } elseif (is_string($command) && $command !== '' && strlen($command) <= 65536 && strpos($command, "\0") === false) {
+        $processCommand = ['/bin/sh', '-c', $command];
+    } else {
+        return tool_error_result('command must be a non-empty string or argv array up to 65536 bytes', ['failure' => 'invalid_arguments']);
+    }
+
+    $cwdArg = isset($args['cwd']) && is_string($args['cwd']) ? $args['cwd'] : '.';
+    try {
+        $cwd = resolve_path($cwdArg, $baseDir, $homeDir);
+    } catch (RuntimeException $e) {
+        return tool_error_result($e->getMessage(), ['failure' => 'invalid_cwd', 'cwd' => $cwdArg]);
+    }
+    $baseRoot = rtrim($baseDir, '/');
+    if (($cwd !== $baseRoot && strpos($cwd, $baseRoot . '/') !== 0) || !is_dir($cwd)) {
+        return tool_error_result('cwd must be an existing directory within base_dir', [
+            'failure'      => 'invalid_cwd',
+            'cwd'          => $cwdArg,
+            'resolved_cwd' => $cwd,
+        ]);
+    }
+
+    $stdin = isset($args['stdin']) && is_string($args['stdin']) ? $args['stdin'] : '';
+    $maxStdin = (int)$settings['max_stdin'];
+    if (strlen($stdin) > $maxStdin) {
+        return tool_error_result('stdin exceeds the configured byte limit', [
+            'failure'         => 'stdin_limit',
+            'stdin_bytes'     => strlen($stdin),
+            'max_stdin_bytes' => $maxStdin,
+        ]);
+    }
+
+    $environment = getenv();
+    if (!is_array($environment)) {
+        $environment = [];
+    }
+    if (isset($args['env'])) {
+        if (!is_array($args['env']) || count($args['env']) > 256) {
+            return tool_error_result('env must be an object with at most 256 entries', ['failure' => 'invalid_arguments']);
+        }
+        foreach ($args['env'] as $name => $value) {
+            if (!is_string($name) || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) !== 1 || !is_string($value) || strpos($value, "\0") !== false) {
+                return tool_error_result('Environment names and values are invalid', ['failure' => 'invalid_arguments']);
+            }
+            $environment[$name] = $value;
+        }
+    }
+
+    $maxTimeout = (float)$settings['max_timeout'];
+    $timeout = isset($args['timeout_seconds']) ? (float)$args['timeout_seconds'] : min(30.0, $maxTimeout);
+    if (!is_finite($timeout) || $timeout < 0.1) {
+        return tool_error_result('timeout_seconds must be at least 0.1', ['failure' => 'invalid_arguments']);
+    }
+    $timeout = min($timeout, $maxTimeout);
+    $maxOutput = (int)$settings['max_output'];
+
+    $descriptors = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+    $processGroup = false;
+    if (function_exists('posix_kill')) {
+        foreach (['/usr/bin/setsid', '/bin/setsid'] as $setsid) {
+            if (is_executable($setsid)) {
+                array_unshift($processCommand, '--');
+                array_unshift($processCommand, $setsid);
+                $processGroup = true;
+                break;
+            }
+        }
+    }
+    $pipes = [];
+    $startedAt = microtime(true);
+    $process = @proc_open($processCommand, $descriptors, $pipes, $cwd, $environment, ['bypass_shell' => true]);
+    if (!is_resource($process)) {
+        return tool_error_result('Failed to start command', [
+            'failure' => 'spawn_failed',
+            'command' => $displayCommand,
+            'cwd'     => $cwd,
+        ]);
+    }
+
+    foreach ($pipes as $pipe) {
+        stream_set_blocking($pipe, false);
+    }
+
+    $stdout = '';
+    $stderr = '';
+    $stdoutDiscarded = 0;
+    $stderrDiscarded = 0;
+    $stdinOffset = 0;
+    $timedOut = false;
+    $terminateAt = null;
+    $lastStatus = null;
+    $observedExitCode = null;
+
+    while (true) {
+        $now = microtime(true);
+        $status = proc_get_status($process);
+        $lastStatus = $status;
+        if (!$status['running'] && $observedExitCode === null && $status['exitcode'] >= 0) {
+            $observedExitCode = $status['exitcode'];
+        }
+
+        if (!$timedOut && ($now - $startedAt) >= $timeout) {
+            $timedOut = true;
+            $terminateAt = $now;
+            if ($status['running'] || $processGroup) {
+                terminate_process($process, $status, 15, $processGroup);
+            }
+        } elseif ($timedOut && ($status['running'] || $processGroup) && $terminateAt !== null && ($now - $terminateAt) >= 0.5) {
+            terminate_process($process, $status, 9, $processGroup);
+        }
+
+        $read = [];
+        if (isset($pipes[1]) && is_resource($pipes[1]) && !feof($pipes[1])) {
+            $read[] = $pipes[1];
+        }
+        if (isset($pipes[2]) && is_resource($pipes[2]) && !feof($pipes[2])) {
+            $read[] = $pipes[2];
+        }
+        $write = [];
+        if (isset($pipes[0]) && is_resource($pipes[0]) && $stdinOffset < strlen($stdin)) {
+            $write[] = $pipes[0];
+        } elseif (isset($pipes[0]) && is_resource($pipes[0])) {
+            fclose($pipes[0]);
+            unset($pipes[0]);
+        }
+
+        if (!empty($read) || !empty($write)) {
+            $except = null;
+            @stream_select($read, $write, $except, 0, 100000);
+            foreach ($read as $pipe) {
+                $chunk = fread($pipe, 8192);
+                if ($chunk !== false && $chunk !== '') {
+                    if (isset($pipes[1]) && $pipe === $pipes[1]) {
+                        append_process_output($stdout, $stdoutDiscarded, $chunk, $maxOutput);
+                    } else {
+                        append_process_output($stderr, $stderrDiscarded, $chunk, $maxOutput);
+                    }
+                }
+            }
+            foreach ($write as $pipe) {
+                $written = @fwrite($pipe, substr($stdin, $stdinOffset, 8192));
+                if ($written === false) {
+                    fclose($pipe);
+                    unset($pipes[0]);
+                } else {
+                    $stdinOffset += $written;
+                }
+            }
+        } else {
+            usleep(10000);
+        }
+
+        $outputOpen = (isset($pipes[1]) && is_resource($pipes[1]) && !feof($pipes[1]))
+            || (isset($pipes[2]) && is_resource($pipes[2]) && !feof($pipes[2]));
+        if (!$status['running'] && !$outputOpen) {
+            break;
+        }
+        if ($timedOut && $terminateAt !== null && ($now - $terminateAt) >= 2.0) {
+            break;
+        }
+    }
+
+    foreach ($pipes as $pipe) {
+        if (is_resource($pipe)) {
+            fclose($pipe);
+        }
+    }
+    $closeExitCode = proc_close($process);
+    $exitCode = $observedExitCode !== null ? $observedExitCode : $closeExitCode;
+    $duration = microtime(true) - $startedAt;
+    $stdoutPayload = encode_process_output($stdout);
+    $stderrPayload = encode_process_output($stderr);
+
+    return [
+        'ok'                     => !$timedOut && $exitCode === 0,
+        'failure'                => $timedOut ? 'timeout' : ($exitCode === 0 ? null : 'nonzero_exit'),
+        'command'                => $displayCommand,
+        'cwd'                    => $cwd,
+        'exit_code'              => $exitCode,
+        'timed_out'              => $timedOut,
+        'termination_scope'      => $processGroup ? 'process_group' : 'process',
+        'termination_signal'     => is_array($lastStatus) && !empty($lastStatus['signaled']) ? $lastStatus['termsig'] : null,
+        'duration_seconds'       => round($duration, 4),
+        'timeout_seconds'        => $timeout,
+        'stdin_bytes_written'    => $stdinOffset,
+        'stdout'                 => $stdoutPayload['content'],
+        'stdout_encoding'        => $stdoutPayload['encoding'],
+        'stdout_truncated'       => $stdoutDiscarded > 0,
+        'stdout_discarded_bytes' => $stdoutDiscarded,
+        'stderr'                 => $stderrPayload['content'],
+        'stderr_encoding'        => $stderrPayload['encoding'],
+        'stderr_truncated'       => $stderrDiscarded > 0,
+        'stderr_discarded_bytes' => $stderrDiscarded,
+    ];
+}
+
 /**
  * Handle a JSON-RPC MCP request (single object, not batch).
  */
@@ -2003,7 +2318,7 @@ function handle_mcp_jsonrpc(array $rpc): void
     }
 
     // For all requests with an id, we enforce config + auth (including initialize).
-    [$homeDir, $baseDir, $token] = load_config_or_fail($id);
+    [$homeDir, $baseDir, $token, $shellSettings] = load_config_or_fail($id);
     enforce_auth_or_fail($token, $id);
 
     switch ($method) {
@@ -2100,6 +2415,11 @@ function handle_mcp_jsonrpc(array $rpc): void
                     $resultPayload = tool_ok_result(
                         fs_diff_tool($homeDir, $baseDir, $args)
                     );
+                    break;
+
+                case 'shell_exec':
+                    $shellResult = shell_exec_tool($homeDir, $baseDir, $token, $shellSettings, $args);
+                    $resultPayload = isset($shellResult['isError']) ? $shellResult : tool_ok_result($shellResult);
                     break;
 
                 default:

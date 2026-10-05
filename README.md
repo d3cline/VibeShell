@@ -14,6 +14,7 @@ A lightweight, single-file PHP implementation of the [Model Context Protocol (MC
 - **MCP 2024-11-05 Compliant** — Full JSON-RPC 2.0 over HTTP transport
 - **Rate Limited** — Built-in protection against abuse (120 requests/minute per IP)
 - **Bearer Token Auth** — Simple, secure API authentication
+- **Bounded Command Execution** — Opt-in commands with timeouts, output caps, stdin, environment overrides, and structured failures
 
 ---
 
@@ -80,6 +81,10 @@ Add to your MCP client configuration:
 | `fs_search` | Search for text within files (recursive grep) |
 | `fs_move` | Move or rename files and directories |
 | `fs_delete` | Delete files or directories (with recursive option) |
+| `fs_read_lines` | Read a line range with optional context |
+| `fs_patch` | Apply line or exact-string patches, with dry-run and backup modes |
+| `fs_diff` | Compare files or a file against supplied content |
+| `shell_exec` | Run argv or shell commands with bounded time, output, stdin, cwd, and environment |
 
 ---
 
@@ -102,6 +107,10 @@ The following paths cannot be modified or deleted:
 - Request size limits (2MB max)
 - Security headers on all responses
 - Timing-safe token comparison
+- Command execution is disabled by default and refuses to run without a non-empty Bearer token
+- Command working directories are confined to `base_dir`
+- Timed-out commands receive SIGTERM, then SIGKILL; process groups are used when supported
+- Standard output, standard error, standard input, command size, and runtime are bounded
 
 ---
 
@@ -120,13 +129,40 @@ token = "your-40-character-hex-token"
 ; "~" = full home directory access (default)
 ; "~/apps" = limit to apps folder only
 base_dir = "~"
+
+; Optional: enable remote command execution. Keep false on file-only endpoints.
+shell_enabled = false
+
+; Optional command limits. Hard caps are 900 seconds and 16 MiB.
+shell_max_timeout = 120
+shell_max_output_bytes = 1048576
+shell_max_stdin_bytes = 1048576
 ```
+
+Enabling `shell_exec` grants authenticated clients the same command authority as the PHP worker's OS user. Use HTTPS, a long unique token, restrictive config permissions, and a dedicated least-privilege account. Set `base_dir` to the narrowest useful directory; it confines the working directory but is not an OS sandbox, so commands may still access anything permitted to that OS user.
+
+`shell_exec` accepts `command` as an argv array or a string. Arrays execute directly and avoid shell interpretation; strings run through `/bin/sh -c` for pipelines, redirects, and compound commands. Optional fields are `cwd`, `stdin`, `env`, and `timeout_seconds`.
+
+```json
+{
+  "name": "shell_exec",
+  "arguments": {
+    "command": ["php", "-v"],
+    "cwd": "apps/example",
+    "timeout_seconds": 10,
+    "env": {"APP_ENV": "production"}
+  }
+}
+```
+
+Results include `exit_code`, separate `stdout` and `stderr`, encodings, duration, timeout state, and truncation byte counts. Expected command failures return `failure: "nonzero_exit"`; validation and host failures are MCP tool errors with a stable `failure` value such as `disabled`, `invalid_cwd`, `stdin_limit`, `spawn_failed`, or `unsupported_host`.
 
 ---
 
 ## 📋 Requirements
 
 - PHP 7.4 or higher
+- PHP `proc_open` enabled when using `shell_exec`
 - Nginx or Apache (any web server that can serve PHP)
 - HTTPS strongly recommended for production
 
